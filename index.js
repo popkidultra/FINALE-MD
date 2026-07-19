@@ -80,6 +80,58 @@ app.listen(config.PORT, () => console.log(`🌐 Server listening on port ${confi
 let conn
 let reconnectAttempts = 0
 
+// ============ LID RESOLUTION ============
+// WhatsApp now routes some senders (non-contacts / privacy-enabled numbers)
+// through an @lid identity instead of the classic @s.whatsapp.net JID.
+// Baileys can fail to encrypt a reply to a bare @lid if the signal session
+// for it hasn't been established yet, so every inbound jid gets normalized
+// to its real phone-number JID here before we use it for anything.
+async function resolveJid(conn, jid, mekKey = {}) {
+  if (!jid || !jid.endsWith('@lid')) return jid
+
+  // 1) Newer Baileys attaches the PN counterpart directly on the message key
+  const directPn = mekKey.participantPn || mekKey.senderPn
+  if (directPn) return directPn.includes('@') ? directPn : `${directPn}@s.whatsapp.net`
+
+  // 2) Baileys' internal LID<->PN mapping store (if exposed on this version)
+  try {
+    const mapped = await conn.signalRepository?.lidMapping?.getPNForLID?.(jid)
+    if (mapped) return mapped.includes('@') ? mapped : `${mapped}@s.whatsapp.net`
+  } catch (e) { /* mapping not available on this version, fall through */ }
+
+  // 3) Legacy/optional helper some Baileys builds expose
+  try {
+    const resolved = await conn.getJidFromLid?.(jid)
+    if (resolved) return resolved
+  } catch (e) { /* ignore */ }
+
+  // Nothing resolved — return the original @lid jid so the caller can still
+  // try sending to it natively rather than silently dropping the message.
+  return jid
+}
+
+// Wraps conn.sendMessage so a failed send is logged instead of vanishing,
+// and retries once against the resolved real JID if the first attempt to
+// an @lid target fails.
+async function safeSend(conn, jid, content, options = {}) {
+  try {
+    return await conn.sendMessage(jid, content, options)
+  } catch (e) {
+    console.error(`⚠️  sendMessage to ${jid} failed:`, e.message)
+    if (jid.endsWith('@lid')) {
+      const resolved = await resolveJid(conn, jid)
+      if (resolved !== jid) {
+        try {
+          return await conn.sendMessage(resolved, content, options)
+        } catch (e2) {
+          console.error(`⚠️  retry sendMessage to ${resolved} also failed:`, e2.message)
+        }
+      }
+    }
+    return null
+  }
+}
+
 async function connectToWA() {
   try {
     console.log('[ ♻️ ] Connecting to WhatsApp...')
@@ -181,7 +233,7 @@ async function connectToWA() {
           ? mek.message.ephemeralMessage.message
           : mek.message
 
-        const from = mek.key.remoteJid
+        let from = mek.key.remoteJid
         const type = getContentType(mek.message)
 
         // ---- Status broadcast handling ----
@@ -189,6 +241,14 @@ async function connectToWA() {
           await handleStatus(conn, mek, type)
           return
         }
+
+        // Normalize an @lid chat/sender to its real phone-number JID up front
+        // so every downstream check (owner, admin, reply target) is reliable.
+        from = await resolveJid(conn, from, mek.key)
+        if (mek.key.participant) {
+          mek.key.participant = await resolveJid(conn, mek.key.participant, mek.key)
+        }
+        mek.key.remoteJid = from
 
         if (config.READ_MESSAGE) await conn.readMessages([mek.key]).catch(() => {})
         await saveMessage(mek)
@@ -225,11 +285,11 @@ async function connectToWA() {
           }
         }
 
-        const reply = (teks) => conn.sendMessage(from, { text: teks }, { quoted: mek })
+        const reply = (teks) => safeSend(conn, from, { text: teks }, { quoted: mek })
 
         if (!mek.key.fromMe && config.AUTO_REACT) {
           const emojis = ['🌼', '❤️', '💐', '🔥', '🏵️', '❄️', '💥']
-          m.react(emojis[Math.floor(Math.random() * emojis.length)]).catch(() => {})
+          safeSend(conn, from, { react: { text: emojis[Math.floor(Math.random() * emojis.length)], key: mek.key } })
         }
 
         if (!isCmd) return
@@ -240,7 +300,7 @@ async function connectToWA() {
         if (cmdDef.groupOnly && !isGroup) return reply('🚫 This command only works in groups.')
         if (cmdDef.adminOnly && isGroup && !isAdmin && !isOwner) return reply('🚫 This command is for group admins only.')
 
-        if (cmdDef.react) conn.sendMessage(from, { react: { text: cmdDef.react, key: mek.key } }).catch(() => {})
+        if (cmdDef.react) safeSend(conn, from, { react: { text: cmdDef.react, key: mek.key } })
 
         try {
           await cmdDef.function(conn, mek, m, {
@@ -268,18 +328,8 @@ async function handleStatus(conn, mek, type) {
     const statusParticipant = mek.key.participant || null
     if (!statusParticipant) return
 
-    // Resolve @lid participants to a real phone-number JID where possible
-    let realJid = statusParticipant
-    if (statusParticipant.endsWith('@lid')) {
-      const rawPn = mek.key?.participantPn || mek.key?.senderPn
-      if (rawPn) {
-        realJid = rawPn.includes('@') ? rawPn : `${rawPn}@s.whatsapp.net`
-      } else {
-        const resolved = await conn.getJidFromLid?.(statusParticipant).catch(() => null)
-        if (resolved) realJid = resolved
-      }
-    }
-
+    // Resolve an @lid participant to a real phone-number JID where possible
+    const realJid = await resolveJid(conn, statusParticipant, mek.key)
     const resolvedKey = { ...mek.key, participant: realJid }
 
     if (config.AUTO_READ_STATUS) await conn.readMessages([resolvedKey]).catch(() => {})
@@ -289,14 +339,14 @@ async function handleStatus(conn, mek, type) {
       if (reactable.includes(type)) {
         const emojis = ['🧩', '🍉', '💜', '🌸', '🪴', '💫', '🌟', '🎋']
         const emoji = emojis[Math.floor(Math.random() * emojis.length)]
-        await conn.sendMessage('status@broadcast', { react: { key: resolvedKey, text: emoji } }, {
+        await safeSend(conn, 'status@broadcast', { react: { key: resolvedKey, text: emoji } }, {
           statusJidList: [realJid, conn.user.id]
-        }).catch(() => {})
+        })
       }
     }
 
     if (config.AUTO_STATUS_REPLY) {
-      await conn.sendMessage(realJid, { text: config.AUTO_STATUS_MSG }, { quoted: mek }).catch(() => {})
+      await safeSend(conn, realJid, { text: config.AUTO_STATUS_MSG }, { quoted: mek })
     }
   } catch (e) {
     console.error('❌ Status handler error:', e.message)
