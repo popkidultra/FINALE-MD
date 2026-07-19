@@ -91,20 +91,17 @@ cmd({
   desc: 'Download and play audio from YouTube',
   category: 'download',
   react: '🎶'
-}, async (conn, mek, m, { reply }) => {
+}, async (conn, mek, m, { reply, q }) => { // <--- Added 'q' here to receive the input query string directly
   try {
-    // Extract the text text query/link after the command
-    const query = m.text.split(' ').slice(1).join(' ');
-
-    if (!query || !query.trim()) {
+    if (!q || !q.trim()) {
       return reply(fmt('PLAY', [
         "Please provide a search term or link.",
-        `Example: ${config.PREFIX}play wake me up`,
+        `Example: ${config.PREFIX}play cardigan`,
         `Link: ${config.PREFIX}play https://youtube.com/...`
       ]));
     }
 
-    const cleanQuery = query.trim();
+    const cleanQuery = q.trim();
     const isUrl = isYtUrl(cleanQuery);
 
     await reply(fmt('PLAY', ["Searching for audio... Please wait."]));
@@ -118,11 +115,9 @@ cmd({
     }
 
     const { url: downloadUrl, title: audioTitle, thumbnail: thumbUrl, sourceUrl } = audioData;
-
-    // Clean filename alphanumeric + basic symbols
     const safeFileName = (audioTitle || cleanQuery).replace(/[^\w\s.-]/g, '') + '.mp3';
 
-    // 1. Send Audio File wrapper (Plays inside the chat)
+    // 1. Send Audio File wrapper (Plays directly inside the chat)
     await conn.sendMessage(m.chat, {
       audio: { url: downloadUrl },
       mimetype: 'audio/mp4',
@@ -140,7 +135,7 @@ cmd({
       } : undefined
     }, { quoted: mek });
 
-    // 2. Send Document File wrapper (Forces download without metadata loss)
+    // 2. Send Document File wrapper (Forces raw file download)
     await conn.sendMessage(m.chat, {
       document: { url: downloadUrl },
       mimetype: 'audio/mpeg',
